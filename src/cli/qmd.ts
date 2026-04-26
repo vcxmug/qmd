@@ -79,6 +79,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { OllamaLLM, type OllamaConfig } from "../ollama.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -121,11 +122,25 @@ function getStore(): ReturnType<typeof createStore> {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
       if (config.models) {
-        setDefaultLlamaCpp(new LlamaCpp({
-          embedModel: config.models.embed,
-          generateModel: config.models.generate,
-          rerankModel: config.models.rerank,
-        }));
+        if (config.models.provider === "ollama") {
+          const ollamaConfig: OllamaConfig = {
+            url: config.models.ollamaUrl,
+            embedModel: config.models.embed,
+            generateModel: config.models.generate,
+            rerankModel: config.models.rerank,
+          };
+          // HACK: setDefaultLlamaCpp expects LlamaCpp type but OllamaLLM implements
+          // the same required methods (tokenize, detokenize) via fallback approximations.
+          // The per-store LLM in createStore() handles the real Ollama backend;
+          // this global default is only a safety net for legacy code paths.
+          setDefaultLlamaCpp(new OllamaLLM(ollamaConfig) as unknown as LlamaCpp);
+        } else {
+          setDefaultLlamaCpp(new LlamaCpp({
+            embedModel: config.models.embed,
+            generateModel: config.models.generate,
+            rerankModel: config.models.rerank,
+          }));
+        }
       }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -3112,7 +3127,20 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
+        // Resolve embed model from config (respects provider: "ollama" vs "llama-cpp")
+        const embedConfig = (() => {
+          try {
+            const cfg = loadConfig();
+            if (cfg.models?.provider === "ollama") {
+              // Ollama uses model name directly, not HF URI
+              return cfg.models.embed || "nomic-embed-text";
+            }
+            return cfg.models?.embed || DEFAULT_EMBED_MODEL_URI;
+          } catch {
+            return DEFAULT_EMBED_MODEL_URI;
+          }
+        })();
+        await vectorIndex(embedConfig, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,

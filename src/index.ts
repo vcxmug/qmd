@@ -67,6 +67,7 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { OllamaLLM, type OllamaConfig } from "./ollama.js";
 import {
   setConfigSource,
   loadConfig,
@@ -365,15 +366,26 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
-    embedModel: config?.models?.embed,
-    generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
-  });
+  // Create LLM instance based on provider type
+  const llm = (() => {
+    if (config?.models?.provider === "ollama") {
+      const ollamaConfig: OllamaConfig = {
+        url: config.models.ollamaUrl,
+        embedModel: config.models.embed,
+        generateModel: config.models.generate,
+        rerankModel: config.models.rerank,
+      };
+      return new OllamaLLM(ollamaConfig);
+    }
+    // Default: LlamaCpp with node-llama-cpp
+    return new LlamaCpp({
+      embedModel: config?.models?.embed,
+      generateModel: config?.models?.generate,
+      rerankModel: config?.models?.rerank,
+      inactivityTimeoutMs: 5 * 60 * 1000,
+      disposeModelsOnInactivity: true,
+    });
+  })();
   internal.llm = llm;
 
   const store: QMDStore = {

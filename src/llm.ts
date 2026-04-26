@@ -373,6 +373,16 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embeddings (may be implemented as sequential calls if backend doesn't support true batching)
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+
+  /**
+   * Name of the default embedding model
+   */
+  embedModelName: string;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -1607,17 +1617,98 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
-  const manager = new LLMSessionManager(llm);
-  const session = new LLMSession(manager, options);
-
+  // For LlamaCpp, use the full session management
+  if (llm instanceof LlamaCpp) {
+    const manager = new LLMSessionManager(llm);
+    const session = new LLMSession(manager, options);
+    try {
+      return await fn(session);
+    } finally {
+      session.release();
+    }
+  }
+  // For other LLM backends (e.g., Ollama), use a simple session wrapper
+  const session = new SimpleLLMSession(llm, options);
   try {
     return await fn(session);
   } finally {
     session.release();
+  }
+}
+
+/**
+ * Simple LLM session wrapper for backends that don't need complex lifecycle management.
+ * Unlike LLMSession, this doesn't track operation counts or use a session manager.
+ */
+class SimpleLLMSession implements ILLMSession {
+  private llm: LLM;
+  private released = false;
+  private abortController: AbortController;
+  private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(llm: LLM, options: LLMSessionOptions = {}) {
+    this.llm = llm;
+    this.abortController = new AbortController();
+
+    if (options.signal) {
+      if (options.signal.aborted) {
+        this.abortController.abort(options.signal.reason);
+      } else {
+        options.signal.addEventListener("abort", () => {
+          this.abortController.abort(options.signal!.reason);
+        }, { once: true });
+      }
+    }
+
+    const maxDuration = options.maxDuration ?? 10 * 60 * 1000;
+    if (maxDuration > 0) {
+      this.maxDurationTimer = setTimeout(() => {
+        this.abortController.abort(new Error("Session exceeded max duration"));
+      }, maxDuration);
+      this.maxDurationTimer.unref();
+    }
+  }
+
+  get isValid(): boolean {
+    return !this.released && !this.abortController.signal.aborted;
+  }
+
+  get signal(): AbortSignal {
+    return this.abortController.signal;
+  }
+
+  release(): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.maxDurationTimer) {
+      clearTimeout(this.maxDurationTimer);
+      this.maxDurationTimer = null;
+    }
+    this.abortController.abort(new Error("Session released"));
+  }
+
+  async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.llm.embed(text, options);
+  }
+
+  async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.llm.embedBatch(texts, options);
+  }
+
+  async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.llm.expandQuery(query, options);
+  }
+
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    if (!this.isValid) throw new SessionReleasedError();
+    return this.llm.rerank(query, documents, options);
   }
 }
 

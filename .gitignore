@@ -10,6 +10,7 @@ texts/
 .github/copilot/
 *.md
 !README.md
+!README_original.md
 !CLAUDE.md
 !CHANGELOG.md
 !skills/**/*.md
