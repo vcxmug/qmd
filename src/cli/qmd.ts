@@ -78,7 +78,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { withLLMSession, type LLM } from "../llm.js";
 import { OllamaLLM, type OllamaConfig } from "../ollama.js";
 import {
   formatSearchResults,
@@ -121,29 +121,17 @@ function getStore(): ReturnType<typeof createStore> {
     try {
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      if (config.models) {
-        if (config.models.provider === "ollama") {
-          const ollamaConfig: OllamaConfig = {
-            url: config.models.ollamaUrl,
-            embedModel: config.models.embed,
-            generateModel: config.models.generate,
-            rerankModel: config.models.rerank,
-          };
-          // HACK: setDefaultLlamaCpp expects LlamaCpp type but OllamaLLM implements
-          // the same required methods (tokenize, detokenize) via fallback approximations.
-          // The per-store LLM in createStore() handles the real Ollama backend;
-          // this global default is only a safety net for legacy code paths.
-          setDefaultLlamaCpp(new OllamaLLM(ollamaConfig) as unknown as LlamaCpp);
-        } else {
-          setDefaultLlamaCpp(new LlamaCpp({
-            embedModel: config.models.embed,
-            generateModel: config.models.generate,
-            rerankModel: config.models.rerank,
-          }));
-        }
-      }
+      // Configure LLM from config
+      const ollamaConfig: OllamaConfig = {
+        url: config.models?.ollamaUrl,
+        embedModel: config.models?.embed,
+        generateModel: config.models?.generate,
+        rerankModel: config.models?.rerank,
+      };
+      store.llm = new OllamaLLM(ollamaConfig);
     } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // Config may not exist — use default OllamaLLM
+      store.llm = new OllamaLLM();
     }
   }
   return store;
@@ -471,53 +459,20 @@ async function showStatus(): Promise<void> {
 
   // Models
   {
-    // hf:org/repo/file.gguf → https://huggingface.co/org/repo
-    const hfLink = (uri: string) => {
-      const match = uri.match(/^hf:([^/]+\/[^/]+)\//);
-      return match ? `https://huggingface.co/${match[1]}` : uri;
-    };
-    console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(DEFAULT_EMBED_MODEL_URI)}`);
-    console.log(`  Reranking:   ${hfLink(DEFAULT_RERANK_MODEL_URI)}`);
-    console.log(`  Generation:  ${hfLink(DEFAULT_GENERATE_MODEL_URI)}`);
+    const storeLlama = getStore();
+    const llm = storeLlama.llm;
+    const embedModel = llm ? llm.embedModelName : "nomic-embed-text";
+    console.log(`\n${c.bold}Ollama Models${c.reset}`);
+    console.log(`  Embedding:   ${embedModel}`);
+    console.log(`  URL:         ${c.dim}http://localhost:11434${c.reset}`);
+    console.log(`  ${c.dim}Configure models in ~/.config/qmd/index.yml${c.reset}`);
   }
 
-  // Device / GPU info
-  // Important: probing node-llama-cpp can abort the whole process on machines with
-  // incompatible GPU drivers (for example Vulkan loader present but no usable driver).
-  // Keep `qmd status` safe by default and make the expensive/native probe opt-in.
-  if (process.env.QMD_STATUS_DEVICE_PROBE === "1") {
+  // Device / GPU info — managed by Ollama
+  {
     console.log(`\n${c.bold}Device${c.reset}`);
-    try {
-      const llm = getDefaultLlamaCpp();
-      const device = await llm.getDeviceInfo({ allowBuild: false });
-      if (device.gpu) {
-        console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);
-        if (device.gpuDevices.length > 0) {
-          // Deduplicate and count GPUs
-          const counts = new Map<string, number>();
-          for (const name of device.gpuDevices) {
-            counts.set(name, (counts.get(name) || 0) + 1);
-          }
-          const deviceStr = Array.from(counts.entries())
-            .map(([name, count]) => count > 1 ? `${count}× ${name}` : name)
-            .join(', ');
-          console.log(`  Devices:  ${deviceStr}`);
-        }
-        if (device.vram) {
-          console.log(`  VRAM:     ${formatBytes(device.vram.free)} free / ${formatBytes(device.vram.total)} total`);
-        }
-      } else {
-        console.log(`  GPU:      ${c.yellow}none${c.reset} (running on CPU — models will be slow)`);
-        console.log(`  ${c.dim}Tip: Install CUDA, Vulkan, or Metal support for GPU acceleration.${c.reset}`);
-      }
-      console.log(`  CPU:      ${device.cpuCores} math cores`);
-    } catch (error) {
-      console.log(`  Status:   ${c.dim}probe failed${c.reset}`);
-      if (error instanceof Error && error.message) {
-        console.log(`  ${c.dim}${error.message}${c.reset}`);
-      }
-    }
+    console.log(`  Backend:     Ollama (CPU/GPU managed by Ollama server)`);
+    console.log(`  ${c.dim}Run 'ollama ps' to see loaded models${c.reset}`);
   }
 
   // Tips section
@@ -1694,7 +1649,7 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 }
 
 async function vectorIndex(
-  model: string = DEFAULT_EMBED_MODEL_URI,
+  model: string = "nomic-embed-text",
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
 ): Promise<void> {
@@ -2306,7 +2261,7 @@ async function vectorSearch(query: string, opts: OutputOptions, _model: string =
 
   checkIndexHealth(store.db);
 
-  await withLLMSession(async () => {
+  await withLLMSession(store.llm!, async () => {
     let results = await vectorSearchQuery(store, query, {
       collection: singleCollection,
       limit: opts.all ? 500 : (opts.limit || 10),
@@ -2362,7 +2317,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
   // Intent can come from --intent flag or from intent: line in query document
   const intent = opts.intent || parsed?.intent;
 
-  await withLLMSession(async () => {
+  await withLLMSession(store.llm!, async () => {
     let results;
 
     if (parsed) {
@@ -3127,17 +3082,13 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        // Resolve embed model from config (respects provider: "ollama" vs "llama-cpp")
+        // Resolve embed model from config
         const embedConfig = (() => {
           try {
             const cfg = loadConfig();
-            if (cfg.models?.provider === "ollama") {
-              // Ollama uses model name directly, not HF URI
-              return cfg.models.embed || "nomic-embed-text";
-            }
-            return cfg.models?.embed || DEFAULT_EMBED_MODEL_URI;
+            return cfg.models?.embed || "nomic-embed-text";
           } catch {
-            return DEFAULT_EMBED_MODEL_URI;
+            return "nomic-embed-text";
           }
         })();
         await vectorIndex(embedConfig, !!cli.values.force, {
@@ -3152,22 +3103,9 @@ if (isMain) {
       break;
 
     case "pull": {
-      const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
-      const models = [
-        DEFAULT_EMBED_MODEL_URI,
-        DEFAULT_GENERATE_MODEL_URI,
-        DEFAULT_RERANK_MODEL_URI,
-      ];
-      console.log(`${c.bold}Pulling models${c.reset}`);
-      const results = await pullModels(models, {
-        refresh,
-        cacheDir: DEFAULT_MODEL_CACHE_DIR,
-      });
-      for (const result of results) {
-        const size = formatBytes(result.sizeBytes);
-        const note = result.refreshed ? "refreshed" : "cached/checked";
-        console.log(`- ${result.model} -> ${result.path} (${size}, ${note})`);
-      }
+      console.log(`${c.bold}Models are managed by Ollama${c.reset}`);
+      console.log(`  ${c.dim}Use 'ollama pull <model>' to download models.${c.reset}`);
+      console.log(`  ${c.dim}See ~/.config/qmd/index.yml for model configuration.${c.reset}`);
       break;
     }
 
@@ -3382,7 +3320,6 @@ if (isMain) {
   }
 
   if (cli.command !== "mcp") {
-    await disposeDefaultLlamaCpp();
     process.exit(0);
   }
 

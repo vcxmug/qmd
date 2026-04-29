@@ -2,7 +2,7 @@
  * ollama.ts - LLM implementation using Ollama's REST API
  *
  * Provides embeddings, text generation, and reranking via Ollama's local models.
- * Use this when you want Ollama to manage models instead of node-llama-cpp.
+ * Use this for Ollama-managed models instead of node-llama-cpp.
  */
 
 import type {
@@ -33,10 +33,6 @@ export type OllamaConfig = {
 
 const DEFAULT_OLLAMA_URL = "http://localhost:11434";
 
-function resolveDefaultModel(envVar: string | undefined, fallback: string): string {
-  return envVar?.trim() || fallback;
-}
-
 export class OllamaLLM implements LLM {
   private readonly url: string;
   private readonly embedModel: string;
@@ -45,10 +41,10 @@ export class OllamaLLM implements LLM {
   private disposed = false;
 
   constructor(config: OllamaConfig = {}) {
-    this.url = resolveDefaultModel(config.url, DEFAULT_OLLAMA_URL);
-    this.embedModel = resolveDefaultModel(config.embedModel, process.env.QMD_OLLAMA_EMBED_MODEL || "mxbai-embed-large");
-    this.generateModel = resolveDefaultModel(config.generateModel, process.env.QMD_OLLAMA_GENERATE_MODEL || "qwen3");
-    this.rerankModel = resolveDefaultModel(config.rerankModel, process.env.QMD_OLLAMA_RERANK_MODEL || this.embedModel);
+    this.url = config.url || DEFAULT_OLLAMA_URL;
+    this.embedModel = config.embedModel || "nomic-embed-text";
+    this.generateModel = config.generateModel || "qmd-query-expansion:1.7b";
+    this.rerankModel = config.rerankModel || this.embedModel;
   }
 
   private async request<T>(path: string, body: unknown): Promise<T> {
@@ -81,9 +77,37 @@ export class OllamaLLM implements LLM {
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
     const model = options?.model || this.embedModel;
-    const formattedText = options?.isQuery
+    let formattedText = options?.isQuery
       ? formatQueryForEmbedding(text, `ollama:${model}`)
       : formatDocForEmbedding(text, options?.title, `ollama:${model}`);
+
+    // ── Context-length guard ──────────────────────────────────────────
+    // nomic-embed-text has a 2048-token context window.
+    // On this 2GB host, exceeding it causes Ollama HTTP 500:
+    //   "the input length exceeds the context length"
+    //
+    // Impact chain discovered 2026-04-29:
+    //   chunk → embed fails → qmd embed (boot) hangs → QMD manager
+    //   enters bad state → ALL subsequent memory_search calls timeout
+    //   after 120s → OpenClaw falls back to builtin every time.
+    //
+    // The chunker's token estimates can be off, especially for
+    // CJK-heavy text (1–1.5 tokens/char vs English ~0.25).
+    // Rerank also passes doc bodies that may exceed the context
+    // window after title prepending. Truncation here is the
+    // narrowest guard that fixes both paths.
+    //
+    // 4000 chars ≈ safe for 2048 tokens in mixed-language text
+    // (~2 chars/token including CJK safety margin).
+    // ─────────────────────────────────────────────────────────────────
+    const MAX_EMBED_CHARS = 4000;
+    if (formattedText.length > MAX_EMBED_CHARS) {
+      console.warn(
+        `Ollama embed: truncating input from ${formattedText.length} to ${MAX_EMBED_CHARS} chars ` +
+        `to fit ${model} context window (2048 tokens)`
+      );
+      formattedText = formattedText.slice(0, MAX_EMBED_CHARS);
+    }
 
     try {
       const response = await this.request<{ embedding: number[] }>("/api/embeddings", {
@@ -102,20 +126,14 @@ export class OllamaLLM implements LLM {
     return Promise.all(texts.map((text) => this.embed(text, options)));
   }
 
-  async generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null> {
-    const model = options?.model || this.generateModel;
-    try {
-      const response = await this.request<{ response: string; done: boolean }>("/api/generate", {
-        model,
-        prompt,
-        stream: false,
-        options: options?.temperature !== undefined ? { temperature: options.temperature } : undefined,
-      });
-      return { text: response.response, model: `ollama:${model}`, done: response.done };
-    } catch (err) {
-      console.error("Ollama generate error:", err);
-      return null;
-    }
+  /**
+   * Text generation is intentionally disabled.
+   * The 2GB host cannot fit both text-generation and embedding models in RAM.
+   * Query expansion has been removed from expandQuery() — see comment there.
+   * If you need generation back, ensure the host has ≥4GB free RAM first.
+   */
+  async generate(_prompt: string, _options?: GenerateOptions): Promise<GenerateResult | null> {
+    return null;
   }
 
   async modelExists(model: string): Promise<ModelInfo> {
@@ -130,26 +148,13 @@ export class OllamaLLM implements LLM {
   }
 
   async expandQuery(query: string, options?: { context?: string; includeLexical?: boolean }): Promise<Queryable[]> {
+    // Query expansion via LLM is deliberately disabled.
+    // The 2GB host cannot fit a text-generation model (~1.8GB) alongside the embed model.
+    // The embed + rerank pipeline already provides strong semantic recall without expansion.
     const results: Queryable[] = [];
 
     if (options?.includeLexical !== false) {
       results.push({ type: "lex", text: query });
-    }
-
-    const prompt = `Given the search query: "${query}"
-${options?.context ? `Context: ${options.context}\n` : ""}
-Generate 1-2 alternative phrasings that capture the same intent but use different words.
-Only output the alternative phrasings, one per line, no numbering.`;
-
-    const result = await this.generate(prompt, { temperature: 0.7 });
-    if (result) {
-      const lines = result.text
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0 && l.length < 200);
-      for (const line of lines.slice(0, 2)) {
-        results.push({ type: "vec", text: line });
-      }
     }
 
     results.push({ type: "vec", text: query });
@@ -158,9 +163,7 @@ Only output the alternative phrasings, one per line, no numbering.`;
   }
 
   async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
-    // Ollama only has access to its own models. The `model` parameter in options
-    // refers to HuggingFace model IDs (used by LlamaCpp) and is ignored here.
-    // We always use this.embedModel (the Ollama embedding model for cosine-similarity reranking).
+    // We always use the configured embedding model for cosine-similarity reranking.
     const model = this.embedModel;
 
     const queryEmbedding = await this.embed(formatQueryForEmbedding(query, `ollama:${model}`), { model, isQuery: true });
@@ -213,7 +216,7 @@ Only output the alternative phrasings, one per line, no numbering.`;
    * Reconstructs text from dummy token IDs by taking the first N chars.
    * This is lossy but sufficient for chunk-truncation scenarios.
    */
-  async detokenize(tokens: readonly { id?: number; [key: string]: unknown }[]): Promise<string> {
+  async detokenize(tokens: readonly number[]): Promise<string> {
     // Tokens are dummy values (0) - return placeholder
     return "[truncated]";
   }

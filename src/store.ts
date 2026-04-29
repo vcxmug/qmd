@@ -19,8 +19,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
+  // LlamaCpp removed — Ollama-only fork
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
@@ -64,7 +63,8 @@ export const CHUNK_WINDOW_CHARS = CHUNK_WINDOW_TOKENS * 4;  // 800 chars
  * falls back to the global singleton.
  */
 function getLlm(store: Store): LLM {
-  return store.llm ?? getDefaultLlamaCpp();
+  if (!store.llm) throw new Error("Store has no LLM instance configured");
+  return store.llm;
 }
 
 // =============================================================================
@@ -1460,6 +1460,7 @@ export async function generateEmbeddings(
 
         const title = extractTitle(doc.body, doc.path);
         const chunks = await chunkDocumentByTokens(
+          llm,
           doc.body,
           undefined, undefined, undefined,
           doc.path,
@@ -2269,6 +2270,7 @@ export async function chunkDocumentAsync(
  * for supported code files.
  */
 export async function chunkDocumentByTokens(
+  llm: LLM,
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
@@ -2277,7 +2279,6 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -3187,12 +3188,12 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+    : await llmOverride!.embed(formattedText, { model, isQuery });
   return result?.embedding || null;
 }
 
@@ -3274,8 +3275,8 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
-  // Note: LlamaCpp uses hardcoded model, model parameter is ignored
+  const llm = llmOverride!;
+  // Note: model parameter is passed through to the Ollama backend
   const results = await llm.expandQuery(query, { intent });
 
   // Map Queryable[] → ExpandedQuery[] (same shape, decoupled from llm.ts internals).
@@ -3320,7 +3321,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const llm = llmOverride!;
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 

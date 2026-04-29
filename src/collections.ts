@@ -40,8 +40,8 @@ export interface ModelsConfig {
   embed?: string;
   rerank?: string;
   generate?: string;
-  /** LLM backend provider: "llama-cpp" (default) or "ollama" */
-  provider?: "llama-cpp" | "ollama";
+  /** LLM backend provider (default: ollama) */
+  provider?: "ollama";
   /** Ollama server URL (only used when provider is "ollama", default: http://localhost:11434) */
   ollamaUrl?: string;
 }
